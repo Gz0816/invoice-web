@@ -11,6 +11,8 @@ env/
 
 .env
 .env.*
+data/config_local.json
 
 dist/
 build/
+

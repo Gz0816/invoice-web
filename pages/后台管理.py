@@ -26,12 +26,26 @@ def init_files():
     ensure_json_file(FUNDS_FILE, [])
     ensure_json_file(NOTICES_FILE, [])
 
-def load_json(path: Path):
+def resolve_json_path(path: Path) -> Path:
+    if not path.exists():
+        return path
     with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    local_config = data.get("local_config") if isinstance(data, dict) else None
+    if isinstance(local_config, str) and local_config:
+        return path.parent / local_config
+    return path
+
+def load_json(path: Path):
+    target_path = resolve_json_path(path)
+    if not target_path.exists():
+        return {}
+    with open(target_path, "r", encoding="utf-8") as f:
         return json.load(f)
 
 def save_json(path: Path, data):
-    with open(path, "w", encoding="utf-8") as f:
+    target_path = resolve_json_path(path)
+    with open(target_path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=4)
 
 def verify_api_key(api_key, secret_key):
