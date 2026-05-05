@@ -1,0 +1,10 @@
+﻿{
+    "gz": { 
+        "api_key": "",
+        "secret_key": ""
+    },
+    "fxt": {
+        "api_key": "",
+        "secret_key": ""
+    }
+}
