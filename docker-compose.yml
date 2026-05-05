@@ -1,0 +1,12 @@
+services:
+  invoice_app:
+    build: .
+    container_name: invoice_app
+    restart: unless-stopped
+    ports:
+      - "8501:8501"
+    environment:
+      ADMIN_PASSWORD: "652103"
+      DATA_DIR: "/app/data"
+    volumes:
+      - ./:/app
