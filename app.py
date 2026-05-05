@@ -61,6 +61,39 @@ HISTORY_FILE = DATA_DIR / "history.json"
 FUNDS_FILE = DATA_DIR / "funds.json"
 NOTICES_FILE = DATA_DIR / "notices.json"
 
+INVENTORY_EXPORT_COLUMNS = [
+    "材料类型",
+    "材料名称",
+    "型号规格",
+    "计量单位",
+    "数量",
+    "单价(元)",
+    "总价(元)",
+    "品牌",
+    "经销商",
+    "有效时间（天）",
+    "低库存告警数",
+    "入库时间",
+    "存放地点",
+    "验收总结",
+    "验收人",
+    "经费编号",
+    "经费名称",
+    "所属学院",
+    "管理员",
+    "备注",
+    "进口",
+]
+
+INVENTORY_EXPORT_ALIASES = {
+    "型号规格": ["规格型号"],
+    "单价(元)": ["单价"],
+    "总价(元)": ["总价"],
+    "有效时间（天）": ["有效时间"],
+    "低库存告警数": ["低库存警告"],
+    "经费编号": ["经费卡号"],
+}
+
 def ensure_json_file(path: Path, default):
     if not path.exists():
         path.write_text(json.dumps(default, ensure_ascii=False, indent=4), encoding="utf-8")
@@ -159,19 +192,33 @@ def save_to_history(df: pd.DataFrame, name: str):
     history.insert(0, record)
     save_json(HISTORY_FILE, history[:20])
 
+def build_inventory_export_df(df: pd.DataFrame) -> pd.DataFrame:
+    export_data = {}
+    for column in INVENTORY_EXPORT_COLUMNS:
+        source_columns = [column] + INVENTORY_EXPORT_ALIASES.get(column, [])
+        source = next((name for name in source_columns if name in df.columns), None)
+        export_data[column] = df[source] if source else ""
+    return pd.DataFrame(export_data, index=df.index)
+
 def build_excel(df: pd.DataFrame) -> bytes:
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-        export_df = df.drop(columns=["发票编号"], errors="ignore")
-        export_df.to_excel(writer, index=False, sheet_name="入库明细")
+        export_df = build_inventory_export_df(df)
+        export_df.to_excel(writer, index=False, sheet_name="入库单")
         wb = writer.book
-        ws = writer.sheets["入库明细"]
-        hdr = wb.add_format({"bold": True, "bg_color": "#D7E4BC", "border": 1})
+        ws = writer.sheets["入库单"]
+        hdr = wb.add_format({"bold": True, "bg_color": "#D7E4BC", "border": 1, "align": "center", "valign": "vcenter"})
+        text_fmt = wb.add_format({"valign": "vcenter"})
+        number_fmt = wb.add_format({"num_format": "0.00", "valign": "vcenter"})
+        money_fmt = wb.add_format({"num_format": "0.00", "valign": "vcenter"})
         for i, col in enumerate(export_df.columns):
             max_len = export_df[col].astype(str).map(len).max() if len(export_df) > 0 else len(col)
             col_w = min(max(max_len, len(col)) + 4, 50)
-            ws.set_column(i, i, col_w)
+            fmt = money_fmt if col in {"单价(元)", "总价(元)"} else number_fmt if col in {"数量", "有效时间（天）", "低库存告警数"} else text_fmt
+            ws.set_column(i, i, col_w, fmt)
             ws.write(0, i, col, hdr)
+        ws.freeze_panes(1, 0)
+        ws.autofilter(0, 0, max(len(export_df), 1), len(export_df.columns) - 1)
     return output.getvalue()
 
 def normalize_name(name: str) -> str:
@@ -190,15 +237,15 @@ def name_match_score(a: str, b: str) -> float:
     return SequenceMatcher(None, na, nb).ratio()
 
 def is_blank_discount_meta(row: dict) -> bool:
-    model_blank = not str(row.get("规格型号", "") or "").strip()
+    model_blank = not str(row.get("型号规格", "") or row.get("规格型号", "") or "").strip()
     unit_blank = not str(row.get("计量单位", "") or "").strip()
     qty_zero = abs(float(row.get("数量", 0) or 0)) < 1e-9
-    price_zero = abs(float(row.get("单价", 0) or 0)) < 1e-9
+    price_zero = abs(float(row.get("单价(元)", row.get("单价", 0)) or 0)) < 1e-9
     return model_blank and unit_blank and qty_zero and price_zero
 
 def merge_discount_rows(invoice_rows: list) -> list:
-    pos_rows = [r.copy() for r in invoice_rows if r["总价"] >= 0]
-    neg_rows = [r.copy() for r in invoice_rows if r["总价"] < 0]
+    pos_rows = [r.copy() for r in invoice_rows if r["总价(元)"] >= 0]
+    neg_rows = [r.copy() for r in invoice_rows if r["总价(元)"] < 0]
     merged_neg_idx = set()
     for i, neg in enumerate(neg_rows):
         best_idx = None
@@ -207,8 +254,8 @@ def merge_discount_rows(invoice_rows: list) -> list:
             score = name_match_score(neg["材料名称"], pos["材料名称"])
             if is_blank_discount_meta(neg):
                 score += 0.03
-            neg_model = str(neg.get("规格型号", "") or "").strip()
-            pos_model = str(pos.get("规格型号", "") or "").strip()
+            neg_model = str(neg.get("型号规格", "") or neg.get("规格型号", "") or "").strip()
+            pos_model = str(pos.get("型号规格", "") or pos.get("规格型号", "") or "").strip()
             if neg_model and pos_model and neg_model == pos_model:
                 score += 0.03
             if score > best_score:
@@ -216,15 +263,15 @@ def merge_discount_rows(invoice_rows: list) -> list:
                 best_idx = j
         if best_idx is not None and best_score >= 0.88:
             base = pos_rows[best_idx]
-            base["总价"] = round(base["总价"] + neg["总价"], 2)
+            base["总价(元)"] = round(base["总价(元)"] + neg["总价(元)"], 2)
             qty = float(base.get("数量", 0) or 0)
-            base["单价"] = round(base["总价"] / qty, 2) if qty else 0.0
-            base["材料类型"] = classify_material(base["单价"])
+            base["单价(元)"] = round(base["总价(元)"] / qty, 2) if qty else 0.0
+            base["材料类型"] = classify_material(base["单价(元)"])
             note = str(base.get("备注", "") or "")
-            extra = f"合并折扣:{neg['材料名称']}({neg['总价']})"
+            extra = f"合并折扣:{neg['材料名称']}({neg['总价(元)']})"
             base["备注"] = f"{note}; {extra}".strip("; ")
             merged_neg_idx.add(i)
-    result = [r for r in pos_rows if abs(r["总价"]) > 1e-9]
+    result = [r for r in pos_rows if abs(r["总价(元)"]) > 1e-9]
     for i, neg in enumerate(neg_rows):
         if i not in merged_neg_idx:
             result.append(neg)
@@ -417,26 +464,25 @@ with tab_extract:
                                 "开票日期": invoice_date,
                                 "材料类型": classify_material(unit_price),
                                 "材料名称": name,
-                                "规格型号": model,
+                                "型号规格": model,
                                 "计量单位": unit,
                                 "数量": quantity,
-                                "单价": unit_price,
-                                "总价": total_price,
+                                "单价(元)": unit_price,
+                                "总价(元)": total_price,
                                 "品牌": "",
                                 "经销商": seller_name,
-                                "有效时间": 0,
-                                "低库存警告": 0,
+                                "有效时间（天）": 0,
+                                "低库存告警数": 0,
                                 "入库时间": datetime.now().strftime("%Y-%m-%d"),
                                 "存放地点": defaults["location"],
                                 "验收总结": defaults["summary"],
                                 "验收人": defaults["inspector"],
                                 "经费名称": selected_fund["名称"],
-                                "经费卡号": selected_fund["卡号"],
-                                "经费负责人": selected_fund["负责人"],
-                                "经费类别": selected_fund["类别"],
+                                "经费编号": selected_fund["卡号"],
                                 "所属学院": defaults["college"],
                                 "管理员": defaults["admin"],
                                 "备注": "",
+                                "进口": "",
                             })
                         merged_rows = merge_discount_rows(invoice_rows)
                         all_new_rows.extend(merged_rows)
@@ -489,13 +535,16 @@ with tab_extract:
                 height=420,
                 column_config={
                     "材料类型": st.column_config.SelectboxColumn("材料类型", options=["易耗品", "低值耐用品", "高额材料物资"], required=True),
+                    "单价(元)": st.column_config.NumberColumn("单价(元)", format="¥%.2f"),
+                    "总价(元)": st.column_config.NumberColumn("总价(元)", format="¥%.2f"),
                     "单价": st.column_config.NumberColumn("单价", format="¥%.2f"),
                     "总价": st.column_config.NumberColumn("总价", format="¥%.2f"),
                     "数量": st.column_config.NumberColumn("数量", format="%.2f"),
                 },
             )
             st.session_state.final_df = edited_df
-            total_amt = edited_df["总价"].sum()
+            total_col = "总价(元)" if "总价(元)" in edited_df.columns else "总价"
+            total_amt = edited_df[total_col].sum()
             type_cnt = edited_df["材料类型"].value_counts().to_dict()
             耗材_cnt = type_cnt.get("易耗品", 0)
             低值_cnt = type_cnt.get("低值耐用品", 0)
@@ -509,7 +558,7 @@ with tab_extract:
             </div>
             """, unsafe_allow_html=True)
             st.markdown("<br>", unsafe_allow_html=True)
-            st.download_button(label="💾 确认无误，下载 Excel 入库台账", data=build_excel(edited_df), file_name=f"422入库明细_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx", type="primary")
+            st.download_button(label="💾 确认无误，下载 Excel 入库单", data=build_excel(edited_df), file_name=f"422入库单_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx", type="primary")
         if show_preview and col_preview is not None:
             with col_preview:
                 current_invoice_ids = st.session_state.final_df["发票编号"].unique().tolist()
@@ -539,7 +588,8 @@ with tab_history:
             with st.expander(f"📋 {record['name']}  ·  {record['time']}  ·  {record['count']} 条记录"):
                 hist_df = pd.DataFrame(record["data"])
                 st.dataframe(hist_df, use_container_width=True, height=260)
-                h_total = hist_df["总价"].sum() if "总价" in hist_df.columns else 0
+                hist_total_col = "总价(元)" if "总价(元)" in hist_df.columns else "总价"
+                h_total = hist_df[hist_total_col].sum() if hist_total_col in hist_df.columns else 0
                 st.markdown(f"<div class='hist-meta'>发票：{', '.join(record.get('files', [])[:5])} | 合计：¥{h_total:,.2f}</div>", unsafe_allow_html=True)
                 hc1, hc2 = st.columns([3, 1])
                 with hc1:
