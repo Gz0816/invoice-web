@@ -1,11 +1,11 @@
 # invoice-web
 
-发票 OCR 识别与入库单导出工具。项目基于 Streamlit 构建，支持批量上传发票图片/PDF，也支持填写多个本地文件夹路径后递归扫描其中的 PDF 文件，自动识别发票明细并导出符合出入库单模板的 Excel。
+发票 OCR 识别与入库单导出工具。项目基于 Streamlit 构建，支持批量上传发票图片/PDF，也支持在浏览器中选择或拖入本地 PDF 文件夹，自动识别发票明细并导出符合出入库单模板的 Excel。
 
 ## 功能
 
 - 批量识别 JPG、PNG、PDF 发票文件
-- 支持多个本地文件夹递归扫描 PDF
+- 支持浏览器上传本地 PDF 文件夹及子目录文件
 - 自动提取材料名称、型号规格、计量单位、数量、单价、总价、经销商等字段
 - 按出入库单模板导出 Excel
 - 支持经费、验收人、存放地点、所属学院、管理员等入库参数预设
@@ -17,40 +17,37 @@
 
 ```text
 invoice_web/
-├─ app.py                  # 主应用
+├─ app.py
 ├─ pages/
-│  └─ 后台管理.py          # Streamlit 后台管理页
+│  └─ 后台管理.py
 ├─ data/
-│  ├─ config_example.json  # OCR 配置示例，会提交到 Git
-│  ├─ config.json          # 本地 OCR 配置，不提交到 Git
-│  ├─ funds.json           # 经费数据
-│  ├─ history.json         # 历史记录
-│  ├─ notices.json         # 公告数据
-│  └─ usage_stats.json     # OCR 调用统计
+│  ├─ config_example.json
+│  ├─ config.json
+│  ├─ funds.json
+│  ├─ history.json
+│  ├─ notices.json
+│  └─ usage_stats.json
 ├─ requirements.txt
 ├─ Dockerfile
 └─ docker-compose.yml
 ```
 
-## 本地启动
+## 配置
 
-1. 安装依赖：
-
-```bash
-pip install -r requirements.txt
-```
-
-2. 创建本地配置文件：
+复制示例配置并填写百度 OCR Key：
 
 ```bash
 copy data\config_example.json data\config.json
 ```
 
-然后在 `data/config.json` 中填写百度 OCR 的 `api_key` 和 `secret_key`。`data/config.json` 已加入 `.gitignore`，不会提交到 GitHub。
+`data/config.json` 已加入 `.gitignore`，只保存在本地，不会提交到 GitHub。
 
-3. 启动应用：
+后台管理密码通过环境变量 `ADMIN_PASSWORD` 配置；Docker 部署时可在 `docker-compose.yml` 中修改。
+
+## 本地启动
 
 ```bash
+pip install -r requirements.txt
 streamlit run app.py
 ```
 
@@ -66,26 +63,39 @@ http://localhost:8501
 docker compose up -d --build
 ```
 
-默认端口是 `8501`。后台管理密码可在 `docker-compose.yml` 的 `ADMIN_PASSWORD` 中修改。
+默认访问地址：
+
+```text
+http://服务器IP:8501
+```
 
 ## 使用说明
 
 1. 进入后台管理页，添加百度 OCR 账号、经费和公告。
 2. 回到主页面，在左侧选择经费并设置入库参数。
-3. 在“发票提取与核对”中上传文件，或在“本地 PDF 文件夹路径”中填写一个或多个文件夹路径。
+3. 在“发票提取与核对”中选择一种上传方式：
+   - 上传发票文件：适合少量 JPG、PNG、PDF 文件。
+   - 选择或拖入本地 PDF 文件夹：适合一个文件夹或多层子目录中的 PDF。
 4. 点击“开始智能提取”。
 5. 在表格中核对、修正识别结果。
 6. 点击“下载 Excel 入库单”导出。
 
-多个文件夹路径支持一行一个，也可以用英文分号分隔。文件夹扫描只读取运行 Streamlit 的机器上的目录。
+## 部署后的文件夹上传说明
 
-## Git 配置说明
+网站部署到服务器后，服务器无法直接读取用户电脑上的本地路径。页面里的目录上传是浏览器上传行为：用户在自己的电脑上选择或拖入文件夹，浏览器把文件上传到服务器识别。
+
+因此不要填写 `D:\...`、`C:\...` 这类本地路径让服务器扫描；应使用页面上的文件上传或目录上传控件。
+
+目录上传能力依赖 Streamlit 1.50 或更高版本，项目的 `requirements.txt` 已设置为 `streamlit>=1.50`。
+
+## Git 说明
 
 会提交：
 
 - `data/config_example.json`
 - 代码文件
 - Docker 和依赖配置
+- 公告、经费、历史等项目数据文件
 
 不会提交：
 

@@ -147,65 +147,31 @@ def save_json(path: Path, data):
         json.dump(data, f, ensure_ascii=False, indent=4)
 
 def build_uploaded_source(file):
+    file_name = file.name.replace("\\", "/")
     return {
-        "key": f"upload::{file.name}",
-        "name": file.name,
-        "display": file.name,
+        "key": f"upload::{file_name}",
+        "name": Path(file_name).name,
+        "display": file_name,
         "suffix": Path(file.name).suffix.lower(),
         "kind": "upload",
         "file": file,
     }
 
-def build_local_pdf_source(path: Path):
-    resolved = path.resolve()
-    return {
-        "key": f"path::{resolved}",
-        "name": path.name,
-        "display": str(resolved),
-        "suffix": ".pdf",
-        "kind": "local",
-        "path": resolved,
-    }
-
 def read_invoice_source(source: dict) -> bytes:
-    if source["kind"] == "local":
-        return source["path"].read_bytes()
     return source["file"].getvalue()
 
 def source_is_processed(source: dict) -> bool:
     return source["key"] in st.session_state.processed_files or source["name"] in st.session_state.processed_files
 
-def discover_pdf_sources(folder_text: str):
-    sources = []
-    errors = []
-    seen = set()
-    folder_paths = [line.strip().strip('"') for line in re.split(r"[\r\n;]+", folder_text or "") if line.strip()]
-    for raw_path in folder_paths:
-        folder = Path(os.path.expandvars(os.path.expanduser(raw_path)))
-        if not folder.exists():
-            errors.append(f"{raw_path} 不存在")
-            continue
-        if not folder.is_dir():
-            errors.append(f"{raw_path} 不是文件夹")
-            continue
-        for pdf_path in sorted(folder.rglob("*.pdf")):
-            try:
-                key = str(pdf_path.resolve()).lower()
-            except OSError:
-                continue
-            if key in seen:
-                continue
-            seen.add(key)
-            sources.append(build_local_pdf_source(pdf_path))
-    return sources, errors
-
 def remember_source_preview(source: dict, file_bytes: bytes):
     preview = {"name": source["name"], "suffix": source["suffix"], "kind": source["kind"]}
-    if source["kind"] == "local":
-        preview["path"] = str(source["path"])
-    else:
-        preview["bytes"] = file_bytes
+    preview["bytes"] = file_bytes
     st.session_state.source_previews[source["key"]] = preview
+
+def supports_directory_upload() -> bool:
+    version_parts = re.findall(r"\d+", st.__version__)
+    major, minor = (int(version_parts[0]), int(version_parts[1])) if len(version_parts) >= 2 else (0, 0)
+    return (major, minor) >= (1, 50)
 
 def get_token(api_key, secret_key):
     url = "https://aip.baidubce.com/oauth/2.0/token" + f"?grant_type=client_credentials&client_id={api_key}&client_secret={secret_key}"
@@ -500,7 +466,7 @@ st.markdown("""
     <div class="app-header-icon">🧾</div>
     <div>
         <h1>陈育伟工作室-发票入库系统</h1>
-        <p>支持批量 JPG / PNG / PDF · 自动分类 · 一键导出台账</p>
+        <p>支持批量 JPG / PNG / PDF · 本地目录上传 · 一键导出入库单</p>
     </div>
 </div>
 """, unsafe_allow_html=True)
@@ -537,11 +503,17 @@ st.markdown("---")
 tab_extract, tab_history = st.tabs(["📥 发票提取与核对", "📚 历史存档"])
 
 with tab_extract:
-    uploaded_files = st.file_uploader("拖拽或点击上传发票（支持批量，已识别文件自动跳过）", type=["png", "jpg", "jpeg", "pdf"], accept_multiple_files=True)
-    folder_text = st.text_area("本地 PDF 文件夹路径（一行一个）", height=86, placeholder=r"D:\发票\4月\第一批")
-    upload_sources = [build_uploaded_source(f) for f in (uploaded_files or [])]
-    folder_sources, folder_errors = discover_pdf_sources(folder_text)
-    invoice_sources = upload_sources + folder_sources
+    uploaded_files = st.file_uploader("上传发票文件（支持批量，已识别文件自动跳过）", type=["png", "jpg", "jpeg", "pdf"], accept_multiple_files=True)
+    if supports_directory_upload():
+        directory_files = st.file_uploader("选择或拖入本地 PDF 文件夹", type=["pdf"], accept_multiple_files="directory", key="directory_pdf_uploads")
+    else:
+        directory_files = []
+        st.info("当前 Streamlit 版本不支持目录上传。部署环境安装 requirements.txt 后即可使用“选择或拖入本地 PDF 文件夹”。")
+    source_map = {}
+    for file in (uploaded_files or []) + (directory_files or []):
+        source = build_uploaded_source(file)
+        source_map[source["key"]] = source
+    invoice_sources = list(source_map.values())
     if invoice_sources:
         st.markdown("##### 📂 待识别文件状态")
         cols = st.columns(min(len(invoice_sources), 6))
@@ -549,14 +521,11 @@ with tab_extract:
             done = source_is_processed(source)
             css = "file-done" if done else "file-pending"
             icon = "✅" if done else "⏳"
-            label = source["name"] if source["kind"] == "upload" else source["display"]
+            label = source["display"]
             label = label if len(label) <= 16 else label[:14] + "…"
             cols[i % 6].markdown(f"<div class='file-card {css}'>{icon} {label}</div>", unsafe_allow_html=True)
-    if folder_text:
-        if folder_errors:
-            for err in folder_errors:
-                st.warning(err)
-        st.caption(f"文件夹扫描到 {len(folder_sources)} 个 PDF")
+    if directory_files:
+        st.caption(f"目录上传读取到 {len(directory_files)} 个 PDF")
     btn_col, _ = st.columns([2, 8])
     with btn_col:
         start = st.button("🚀 开始智能提取", type="primary", disabled=is_locked or not invoice_sources, use_container_width=True)
@@ -574,7 +543,7 @@ with tab_extract:
                 progress_bar = st.progress(0, text="正在识别中…")
                 status_ph = st.empty()
                 for idx, source in enumerate(new_sources):
-                    display_name = source["display"] if source["kind"] == "local" else source["name"]
+                    display_name = source["display"]
                     usage_data = load_json(USAGE_FILE)
                     live_usage = usage_data.get("usage", {}).get(conf["api_key"], 0)
                     if live_usage >= 800:
@@ -676,15 +645,7 @@ with tab_extract:
                     preview = st.session_state.source_previews.get(preview_key)
                     if preview:
                         st.markdown(f"<span style='font-size:11.5px;color:#94A3B8'>📄 {preview['name']}</span>", unsafe_allow_html=True)
-                        if preview.get("kind") == "local":
-                            preview_path = Path(preview["path"])
-                            if not preview_path.exists():
-                                st.info("⚠️ 原文件已移动或删除，无法预览。")
-                                preview_bytes = None
-                            else:
-                                preview_bytes = preview_path.read_bytes()
-                        else:
-                            preview_bytes = preview["bytes"]
+                        preview_bytes = preview["bytes"]
                         if preview_bytes and preview["suffix"] == ".pdf":
                             b64 = base64.b64encode(preview_bytes).decode()
                             st.markdown(f'<iframe src="data:application/pdf;base64,{b64}" width="100%" height="580" style="border:1px solid #E2E8F0;border-radius:10px;"></iframe>', unsafe_allow_html=True)
