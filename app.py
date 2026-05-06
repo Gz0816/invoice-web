@@ -116,6 +116,7 @@ _defaults = {
     "file_mapping": {},
     "source_previews": {},
     "dismissed_notices": set(),
+    "upload_reset_id": 0,
 }
 for k, v in _defaults.items():
     if k not in st.session_state:
@@ -162,6 +163,9 @@ def read_invoice_source(source: dict) -> bytes:
 
 def source_is_processed(source: dict) -> bool:
     return source["key"] in st.session_state.processed_files or source["name"] in st.session_state.processed_files
+
+def is_pdf_upload(file) -> bool:
+    return Path(file.name).suffix.lower() == ".pdf"
 
 def remember_source_preview(source: dict, file_bytes: bytes):
     preview = {"name": source["name"], "suffix": source["suffix"], "kind": source["kind"]}
@@ -503,14 +507,18 @@ st.markdown("---")
 tab_extract, tab_history = st.tabs(["📥 发票提取与核对", "📚 历史存档"])
 
 with tab_extract:
-    uploaded_files = st.file_uploader("上传发票文件（支持批量，已识别文件自动跳过）", type=["png", "jpg", "jpeg", "pdf"], accept_multiple_files=True)
+    upload_key = f"invoice_uploads_{st.session_state.upload_reset_id}"
+    directory_key = f"directory_pdf_uploads_{st.session_state.upload_reset_id}"
+    uploaded_files = st.file_uploader("上传发票文件（支持批量，已识别文件自动跳过）", type=["png", "jpg", "jpeg", "pdf"], accept_multiple_files=True, key=upload_key)
     if supports_directory_upload():
-        directory_files = st.file_uploader("选择或拖入本地 PDF 文件夹", type=["pdf"], accept_multiple_files="directory", key="directory_pdf_uploads")
+        directory_files = st.file_uploader("选择或拖入本地 PDF 文件夹", type=["pdf"], accept_multiple_files="directory", key=directory_key)
     else:
         directory_files = []
         st.info("当前 Streamlit 版本不支持目录上传。部署环境安装 requirements.txt 后即可使用“选择或拖入本地 PDF 文件夹”。")
+    valid_directory_files = [file for file in (directory_files or []) if is_pdf_upload(file)]
+    skipped_directory_files = len(directory_files or []) - len(valid_directory_files)
     source_map = {}
-    for file in (uploaded_files or []) + (directory_files or []):
+    for file in (uploaded_files or []) + valid_directory_files:
         source = build_uploaded_source(file)
         source_map[source["key"]] = source
     invoice_sources = list(source_map.values())
@@ -525,10 +533,16 @@ with tab_extract:
             label = label if len(label) <= 16 else label[:14] + "…"
             cols[i % 6].markdown(f"<div class='file-card {css}'>{icon} {label}</div>", unsafe_allow_html=True)
     if directory_files:
-        st.caption(f"目录上传读取到 {len(directory_files)} 个 PDF")
-    btn_col, _ = st.columns([2, 8])
+        st.caption(f"目录上传读取到 {len(valid_directory_files)} 个 PDF")
+    if skipped_directory_files:
+        st.warning(f"已跳过 {skipped_directory_files} 个非 PDF 文件。")
+    btn_col, clear_col, _ = st.columns([2, 2, 6])
     with btn_col:
         start = st.button("🚀 开始智能提取", type="primary", disabled=is_locked or not invoice_sources, use_container_width=True)
+    with clear_col:
+        if st.button("🧹 清除上传文件", disabled=not (uploaded_files or directory_files), use_container_width=True):
+            st.session_state.upload_reset_id += 1
+            st.rerun()
     if start:
         new_sources = [source for source in invoice_sources if not source_is_processed(source)]
         if not new_sources:
