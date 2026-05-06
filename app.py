@@ -62,7 +62,6 @@ USAGE_FILE = DATA_DIR / "usage_stats.json"
 HISTORY_FILE = DATA_DIR / "history.json"
 FUNDS_FILE = DATA_DIR / "funds.json"
 NOTICES_FILE = DATA_DIR / "notices.json"
-DISMISSED_NOTICES_FILE = DATA_DIR / "dismissed_notices.json"
 
 INVENTORY_EXPORT_COLUMNS = [
     "材料类型",
@@ -107,7 +106,6 @@ def init_files():
     ensure_json_file(HISTORY_FILE, [])
     ensure_json_file(FUNDS_FILE, [])
     ensure_json_file(NOTICES_FILE, [])
-    ensure_json_file(DISMISSED_NOTICES_FILE, [])
 
 init_files()
 
@@ -147,13 +145,6 @@ def save_json(path: Path, data):
     target_path = resolve_json_path(path)
     with open(target_path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=4)
-
-def get_dismissed_notice_ids() -> set:
-    data = load_json(DISMISSED_NOTICES_FILE)
-    return set(data if isinstance(data, list) else [])
-
-def save_dismissed_notice_ids(ids: set):
-    save_json(DISMISSED_NOTICES_FILE, sorted(ids))
 
 def build_uploaded_source(file):
     return {
@@ -410,11 +401,9 @@ def extract_invoice_rows(source: dict, token: str, api_key: str, invoice_id: str
     return merge_discount_rows(invoice_rows), None, file_bytes
 
 def render_notice_popup(notices: list):
-    dismissed_forever = get_dismissed_notice_ids()
     active = [
         n for n in notices
         if n.get("active", True)
-        and str(n.get("id", "")) not in dismissed_forever
         and str(n.get("id", "")) not in st.session_state.dismissed_notices
     ]
     if not active:
@@ -436,17 +425,9 @@ def render_notice_popup(notices: list):
                 </div>
             </div>
         """, unsafe_allow_html=True)
-        close_col, dismiss_col = st.columns(2)
-        with close_col:
-            if st.button("关闭", key=f"close_notice_{nid}", use_container_width=True):
-                st.session_state.dismissed_notices.add(nid)
-                st.rerun()
-        with dismiss_col:
-            if st.button("不再显示", key=f"dismiss_notice_{nid}", type="primary", use_container_width=True):
-                dismissed_forever.add(nid)
-                save_dismissed_notice_ids(dismissed_forever)
-                st.session_state.dismissed_notices.add(nid)
-                st.rerun()
+        if st.button("关闭", key=f"close_notice_{nid}", type="primary", use_container_width=True):
+            st.session_state.dismissed_notices.add(nid)
+            st.rerun()
 
     dialog_factory = getattr(st, "dialog", None) or getattr(st, "experimental_dialog", None)
     if dialog_factory:
