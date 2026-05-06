@@ -12,6 +12,7 @@ env/
 .env
 .env.*
 data/config.json
+data/dismissed_notices.json
 
 dist/
 build/

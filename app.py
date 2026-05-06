@@ -48,6 +48,8 @@ st.markdown("""
     .notice-body { flex: 1; }
     .notice-title { font-weight: 700; font-size: 14px; margin-bottom: 2px; }
     .notice-meta { font-size: 11px; opacity: .6; margin-top: 4px; }
+    .notice-popup { border-radius: 8px; padding: 12px 14px; margin-bottom: 12px; display: flex; align-items: flex-start; gap: 10px; font-size: 13.5px; line-height: 1.65; }
+    .folder-list { border: 1px dashed #CBD5E1; background: #F8FAFC; border-radius: 8px; padding: 10px 12px; color: #475569; font-size: 12.5px; line-height: 1.7; }
     div[data-testid="stProgress"] > div { height: 6px !important; border-radius: 99px; }
 </style>
 """, unsafe_allow_html=True)
@@ -60,6 +62,7 @@ USAGE_FILE = DATA_DIR / "usage_stats.json"
 HISTORY_FILE = DATA_DIR / "history.json"
 FUNDS_FILE = DATA_DIR / "funds.json"
 NOTICES_FILE = DATA_DIR / "notices.json"
+DISMISSED_NOTICES_FILE = DATA_DIR / "dismissed_notices.json"
 
 INVENTORY_EXPORT_COLUMNS = [
     "材料类型",
@@ -104,6 +107,7 @@ def init_files():
     ensure_json_file(HISTORY_FILE, [])
     ensure_json_file(FUNDS_FILE, [])
     ensure_json_file(NOTICES_FILE, [])
+    ensure_json_file(DISMISSED_NOTICES_FILE, [])
 
 init_files()
 
@@ -112,6 +116,7 @@ _defaults = {
     "final_df": pd.DataFrame(),
     "usage_stats": {},
     "file_mapping": {},
+    "source_previews": {},
     "dismissed_notices": set(),
 }
 for k, v in _defaults.items():
@@ -142,6 +147,74 @@ def save_json(path: Path, data):
     target_path = resolve_json_path(path)
     with open(target_path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=4)
+
+def get_dismissed_notice_ids() -> set:
+    data = load_json(DISMISSED_NOTICES_FILE)
+    return set(data if isinstance(data, list) else [])
+
+def save_dismissed_notice_ids(ids: set):
+    save_json(DISMISSED_NOTICES_FILE, sorted(ids))
+
+def build_uploaded_source(file):
+    return {
+        "key": f"upload::{file.name}",
+        "name": file.name,
+        "display": file.name,
+        "suffix": Path(file.name).suffix.lower(),
+        "kind": "upload",
+        "file": file,
+    }
+
+def build_local_pdf_source(path: Path):
+    resolved = path.resolve()
+    return {
+        "key": f"path::{resolved}",
+        "name": path.name,
+        "display": str(resolved),
+        "suffix": ".pdf",
+        "kind": "local",
+        "path": resolved,
+    }
+
+def read_invoice_source(source: dict) -> bytes:
+    if source["kind"] == "local":
+        return source["path"].read_bytes()
+    return source["file"].getvalue()
+
+def source_is_processed(source: dict) -> bool:
+    return source["key"] in st.session_state.processed_files or source["name"] in st.session_state.processed_files
+
+def discover_pdf_sources(folder_text: str):
+    sources = []
+    errors = []
+    seen = set()
+    folder_paths = [line.strip().strip('"') for line in re.split(r"[\r\n;]+", folder_text or "") if line.strip()]
+    for raw_path in folder_paths:
+        folder = Path(os.path.expandvars(os.path.expanduser(raw_path)))
+        if not folder.exists():
+            errors.append(f"{raw_path} 不存在")
+            continue
+        if not folder.is_dir():
+            errors.append(f"{raw_path} 不是文件夹")
+            continue
+        for pdf_path in sorted(folder.rglob("*.pdf")):
+            try:
+                key = str(pdf_path.resolve()).lower()
+            except OSError:
+                continue
+            if key in seen:
+                continue
+            seen.add(key)
+            sources.append(build_local_pdf_source(pdf_path))
+    return sources, errors
+
+def remember_source_preview(source: dict, file_bytes: bytes):
+    preview = {"name": source["name"], "suffix": source["suffix"], "kind": source["kind"]}
+    if source["kind"] == "local":
+        preview["path"] = str(source["path"])
+    else:
+        preview["bytes"] = file_bytes
+    st.session_state.source_previews[source["key"]] = preview
 
 def get_token(api_key, secret_key):
     url = "https://aip.baidubce.com/oauth/2.0/token" + f"?grant_type=client_credentials&client_id={api_key}&client_secret={secret_key}"
@@ -277,6 +350,120 @@ def merge_discount_rows(invoice_rows: list) -> list:
             result.append(neg)
     return result
 
+def extract_invoice_rows(source: dict, token: str, api_key: str, invoice_id: str, defaults: dict, selected_fund: dict):
+    url = f"https://aip.baidubce.com/rest/2.0/ocr/v1/vat_invoice?access_token={token}"
+    file_bytes = read_invoice_source(source)
+    file_b64 = base64.b64encode(file_bytes).decode()
+    payload = {"pdf_file": file_b64} if source["suffix"] == ".pdf" else {"image": file_b64}
+    res = requests.post(url, data=payload, timeout=15).json()
+    increment_usage(api_key)
+    if "words_result" not in res:
+        return [], res.get("error_msg", "未知错误"), file_bytes
+
+    words = res["words_result"]
+    seller_name = word_val(words.get("SellerName", ""))
+    invoice_num = word_val(words.get("InvoiceNum", ""))
+    invoice_date = word_val(words.get("InvoiceDate", ""))
+    names = words.get("CommodityName", [])
+    nums = words.get("CommodityNum", [])
+    amounts = words.get("CommodityAmount", [])
+    taxes = words.get("CommodityTax", [])
+    models = words.get("CommodityType", [])
+    units = words.get("CommodityUnit", [])
+    invoice_rows = []
+    for i in range(len(names)):
+        name = names[i].get("word", "未识别") if i < len(names) else "未识别"
+        pretax_amount = safe_float(amounts, i, default=0.0)
+        tax_amount = safe_float(taxes, i, default=0.0)
+        total_price = round(pretax_amount + tax_amount, 2)
+        quantity_raw = safe_float(nums, i, default=0.0)
+        quantity = 0.0 if quantity_raw == 0 and total_price < 0 else quantity_raw or 1.0
+        unit_price = round(total_price / quantity, 2) if quantity else 0.0
+        model = models[i].get("word", "") if i < len(models) else ""
+        unit = units[i].get("word", "") if i < len(units) else ""
+        invoice_rows.append({
+            "发票编号": invoice_id,
+            "发票号码": invoice_num,
+            "开票日期": invoice_date,
+            "材料类型": classify_material(unit_price),
+            "材料名称": name,
+            "型号规格": model,
+            "计量单位": unit,
+            "数量": quantity,
+            "单价(元)": unit_price,
+            "总价(元)": total_price,
+            "品牌": "",
+            "经销商": seller_name,
+            "有效时间（天）": 0,
+            "低库存告警数": 0,
+            "入库时间": datetime.now().strftime("%Y-%m-%d"),
+            "存放地点": defaults["location"],
+            "验收总结": defaults["summary"],
+            "验收人": defaults["inspector"],
+            "经费名称": selected_fund["名称"],
+            "经费编号": selected_fund["卡号"],
+            "所属学院": defaults["college"],
+            "管理员": defaults["admin"],
+            "备注": "",
+            "进口": "",
+        })
+    return merge_discount_rows(invoice_rows), None, file_bytes
+
+def render_notice_popup(notices: list):
+    dismissed_forever = get_dismissed_notice_ids()
+    active = [
+        n for n in notices
+        if n.get("active", True)
+        and str(n.get("id", "")) not in dismissed_forever
+        and str(n.get("id", "")) not in st.session_state.dismissed_notices
+    ]
+    if not active:
+        return
+
+    ntc = active[0]
+    nid = str(ntc.get("id", ""))
+    level_map = {"📘 普通": ("notice-info", "📘"), "⚠️ 重要": ("notice-warning", "⚠️"), "🚨 紧急": ("notice-danger", "🚨")}
+    css, icon = level_map.get(ntc.get("level", "📘 普通"), ("notice-info", "📘"))
+
+    def notice_body():
+        st.markdown(f"""
+            <div class="notice-popup {css}">
+                <div class="notice-icon">{icon}</div>
+                <div class="notice-body">
+                    <div class="notice-title">{ntc.get('title', '公告')}</div>
+                    {ntc.get('content', '')}
+                    <div class="notice-meta">📅 发布于 {ntc.get('time', '')}</div>
+                </div>
+            </div>
+        """, unsafe_allow_html=True)
+        close_col, dismiss_col = st.columns(2)
+        with close_col:
+            if st.button("关闭", key=f"close_notice_{nid}", use_container_width=True):
+                st.session_state.dismissed_notices.add(nid)
+                st.rerun()
+        with dismiss_col:
+            if st.button("不再显示", key=f"dismiss_notice_{nid}", type="primary", use_container_width=True):
+                dismissed_forever.add(nid)
+                save_dismissed_notice_ids(dismissed_forever)
+                st.session_state.dismissed_notices.add(nid)
+                st.rerun()
+
+    dialog_factory = getattr(st, "dialog", None) or getattr(st, "experimental_dialog", None)
+    if dialog_factory:
+        try:
+            dialog_decorator = dialog_factory("公告", width="small")
+        except TypeError:
+            dialog_decorator = dialog_factory("公告")
+
+        @dialog_decorator
+        def notice_dialog():
+            notice_body()
+
+        notice_dialog()
+    else:
+        with st.container(border=True):
+            notice_body()
+
 st.session_state.usage_stats = load_json(USAGE_FILE)
 all_configs = load_json(CONFIG_FILE)
 all_funds = load_json(FUNDS_FILE)
@@ -315,6 +502,7 @@ with st.sidebar:
             st.session_state.processed_files = []
             st.session_state.final_df = pd.DataFrame()
             st.session_state.file_mapping = {}
+            st.session_state.source_previews = {}
             st.rerun()
     with c2:
         if st.button("💾 存入历史", use_container_width=True):
@@ -336,29 +524,7 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-active_notices = [n for n in all_notices if n.get("active", True)]
-for ntc in active_notices:
-    nid = ntc["id"]
-    if nid not in st.session_state.dismissed_notices:
-        level_map = {"📘 普通": ("notice-info", "📘"), "⚠️ 重要": ("notice-warning", "⚠️"), "🚨 紧急": ("notice-danger", "🚨")}
-        css, icon = level_map.get(ntc.get("level", "📘 普通"), ("notice-info", "📘"))
-        col_msg, col_btn = st.columns([11, 1])
-        with col_msg:
-            st.markdown(f"""
-                <div class="notice-banner {css}">
-                    <div class="notice-icon">{icon}</div>
-                    <div class="notice-body">
-                        <div class="notice-title">{ntc['title']}</div>
-                        {ntc['content']}
-                        <div class="notice-meta">📅 发布于 {ntc['time']}</div>
-                    </div>
-                </div>
-            """, unsafe_allow_html=True)
-        with col_btn:
-            st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
-            if st.button("✕", key=f"close_ntc_{nid}", help="关闭此公告"):
-                st.session_state.dismissed_notices.add(nid)
-                st.rerun()
+render_notice_popup(all_notices)
 
 if not all_configs:
     st.warning("当前没有可用百度 OCR 账号，请到“后台管理”页面添加。")
@@ -391,21 +557,31 @@ tab_extract, tab_history = st.tabs(["📥 发票提取与核对", "📚 历史�
 
 with tab_extract:
     uploaded_files = st.file_uploader("拖拽或点击上传发票（支持批量，已识别文件自动跳过）", type=["png", "jpg", "jpeg", "pdf"], accept_multiple_files=True)
-    if uploaded_files:
-        st.markdown("##### 📂 上传文件状态")
-        cols = st.columns(min(len(uploaded_files), 6))
-        for i, f in enumerate(uploaded_files):
-            done = f.name in st.session_state.processed_files
+    folder_text = st.text_area("本地 PDF 文件夹路径（一行一个）", height=86, placeholder=r"D:\发票\4月\第一批")
+    upload_sources = [build_uploaded_source(f) for f in (uploaded_files or [])]
+    folder_sources, folder_errors = discover_pdf_sources(folder_text)
+    invoice_sources = upload_sources + folder_sources
+    if invoice_sources:
+        st.markdown("##### 📂 待识别文件状态")
+        cols = st.columns(min(len(invoice_sources), 6))
+        for i, source in enumerate(invoice_sources):
+            done = source_is_processed(source)
             css = "file-done" if done else "file-pending"
             icon = "✅" if done else "⏳"
-            label = f.name if len(f.name) <= 16 else f.name[:14] + "…"
+            label = source["name"] if source["kind"] == "upload" else source["display"]
+            label = label if len(label) <= 16 else label[:14] + "…"
             cols[i % 6].markdown(f"<div class='file-card {css}'>{icon} {label}</div>", unsafe_allow_html=True)
+    if folder_text:
+        if folder_errors:
+            for err in folder_errors:
+                st.warning(err)
+        st.caption(f"文件夹扫描到 {len(folder_sources)} 个 PDF")
     btn_col, _ = st.columns([2, 8])
     with btn_col:
-        start = st.button("🚀 开始智能提取", type="primary", disabled=is_locked or not uploaded_files, use_container_width=True)
+        start = st.button("🚀 开始智能提取", type="primary", disabled=is_locked or not invoice_sources, use_container_width=True)
     if start:
-        new_files = [f for f in uploaded_files if f.name not in st.session_state.processed_files]
-        if not new_files:
+        new_sources = [source for source in invoice_sources if not source_is_processed(source)]
+        if not new_sources:
             st.toast("💡 所有文件均已处理过，无需重复识别！")
         else:
             conf = all_configs[selected_name]
@@ -416,80 +592,28 @@ with tab_extract:
                 all_new_rows = []
                 progress_bar = st.progress(0, text="正在识别中…")
                 status_ph = st.empty()
-                for idx, file in enumerate(new_files):
-                    live_usage = load_json(USAGE_FILE)["usage"].get(conf["api_key"], 0)
+                for idx, source in enumerate(new_sources):
+                    display_name = source["display"] if source["kind"] == "local" else source["name"]
+                    usage_data = load_json(USAGE_FILE)
+                    live_usage = usage_data.get("usage", {}).get(conf["api_key"], 0)
                     if live_usage >= 800:
-                        st.error(f"⚠️ 处理「{file.name}」时额度达到 800 次上限，已中止！")
+                        st.error(f"⚠️ 处理「{display_name}」时额度达到 800 次上限，已中止！")
                         break
-                    status_ph.info(f"正在识别 {idx + 1}/{len(new_files)}：{file.name}")
+                    status_ph.info(f"正在识别 {idx + 1}/{len(new_sources)}：{display_name}")
                     try:
-                        url = f"https://aip.baidubce.com/rest/2.0/ocr/v1/vat_invoice?access_token={token}"
-                        file_b64 = base64.b64encode(file.getvalue()).decode()
-                        payload = {"pdf_file": file_b64} if file.name.lower().endswith(".pdf") else {"image": file_b64}
-                        res = requests.post(url, data=payload, timeout=15).json()
-                        increment_usage(conf["api_key"])
-                        if "words_result" not in res:
-                            st.error(f"识别异常（{file.name}）: {res.get('error_msg', '未知错误')}")
-                            continue
-                        words = res["words_result"]
-                        seller_name = word_val(words.get("SellerName", ""))
-                        invoice_num = word_val(words.get("InvoiceNum", ""))
-                        invoice_date = word_val(words.get("InvoiceDate", ""))
-                        names = words.get("CommodityName", [])
-                        nums = words.get("CommodityNum", [])
-                        amounts = words.get("CommodityAmount", [])
-                        taxes = words.get("CommodityTax", [])
-                        models = words.get("CommodityType", [])
-                        units = words.get("CommodityUnit", [])
                         invoice_idx = len(st.session_state.processed_files) + 1
                         invoice_id = f"第 {invoice_idx} 张"
-                        st.session_state.file_mapping[invoice_id] = file.name
-                        invoice_rows = []
-                        for i in range(len(names)):
-                            name = names[i].get("word", "未识别") if i < len(names) else "未识别"
-                            pretax_amount = safe_float(amounts, i, default=0.0)
-                            tax_amount = safe_float(taxes, i, default=0.0)
-                            total_price = round(pretax_amount + tax_amount, 2)
-                            quantity_raw = safe_float(nums, i, default=0.0)
-                            if quantity_raw == 0:
-                                quantity = 0.0 if total_price < 0 else 1.0
-                            else:
-                                quantity = quantity_raw
-                            unit_price = round(total_price / quantity, 2) if quantity else 0.0
-                            model = models[i].get("word", "") if i < len(models) else ""
-                            unit = units[i].get("word", "") if i < len(units) else ""
-                            invoice_rows.append({
-                                "发票编号": invoice_id,
-                                "发票号码": invoice_num,
-                                "开票日期": invoice_date,
-                                "材料类型": classify_material(unit_price),
-                                "材料名称": name,
-                                "型号规格": model,
-                                "计量单位": unit,
-                                "数量": quantity,
-                                "单价(元)": unit_price,
-                                "总价(元)": total_price,
-                                "品牌": "",
-                                "经销商": seller_name,
-                                "有效时间（天）": 0,
-                                "低库存告警数": 0,
-                                "入库时间": datetime.now().strftime("%Y-%m-%d"),
-                                "存放地点": defaults["location"],
-                                "验收总结": defaults["summary"],
-                                "验收人": defaults["inspector"],
-                                "经费名称": selected_fund["名称"],
-                                "经费编号": selected_fund["卡号"],
-                                "所属学院": defaults["college"],
-                                "管理员": defaults["admin"],
-                                "备注": "",
-                                "进口": "",
-                            })
-                        merged_rows = merge_discount_rows(invoice_rows)
-                        all_new_rows.extend(merged_rows)
-                        st.session_state.processed_files.append(file.name)
+                        rows, error_msg, file_bytes = extract_invoice_rows(source, token, conf["api_key"], invoice_id, defaults, selected_fund)
+                        if error_msg:
+                            st.error(f"识别异常（{display_name}）: {error_msg}")
+                            continue
+                        all_new_rows.extend(rows)
+                        st.session_state.file_mapping[invoice_id] = source["key"]
+                        remember_source_preview(source, file_bytes)
+                        st.session_state.processed_files.append(source["key"])
                     except Exception as e:
-                        st.error(f"处理「{file.name}」时出错：{e}")
-                    progress_bar.progress((idx + 1) / len(new_files), text=f"已完成 {idx + 1}/{len(new_files)}")
+                        st.error(f"处理「{display_name}」时出错：{e}")
+                    progress_bar.progress((idx + 1) / len(new_sources), text=f"已完成 {idx + 1}/{len(new_sources)}")
                 status_ph.empty()
                 if all_new_rows:
                     new_df = pd.DataFrame(all_new_rows)
@@ -517,11 +641,14 @@ with tab_extract:
                         st.session_state.final_df = pd.DataFrame()
                         st.session_state.processed_files = []
                         st.session_state.file_mapping = {}
+                        st.session_state.source_previews = {}
                         st.rerun()
                     else:
-                        target_filename = st.session_state.file_mapping.get(del_target)
-                        if target_filename and target_filename in st.session_state.processed_files:
-                            st.session_state.processed_files.remove(target_filename)
+                        target_key = st.session_state.file_mapping.get(del_target)
+                        if target_key and target_key in st.session_state.processed_files:
+                            st.session_state.processed_files.remove(target_key)
+                        if target_key:
+                            st.session_state.source_previews.pop(target_key, None)
                         st.session_state.final_df = st.session_state.final_df[st.session_state.final_df["发票编号"] != del_target].reset_index(drop=True)
                         st.rerun()
             with dc3:
@@ -562,17 +689,26 @@ with tab_extract:
         if show_preview and col_preview is not None:
             with col_preview:
                 current_invoice_ids = st.session_state.final_df["发票编号"].unique().tolist()
-                if current_invoice_ids and uploaded_files:
+                if current_invoice_ids:
                     preview_label = st.selectbox("🔍 切换发票原件", current_invoice_ids)
-                    preview_file_name = st.session_state.file_mapping.get(preview_label)
-                    file_obj = next((f for f in uploaded_files if f.name == preview_file_name), None)
-                    if file_obj:
-                        st.markdown(f"<span style='font-size:11.5px;color:#94A3B8'>📄 {preview_file_name}</span>", unsafe_allow_html=True)
-                        if preview_file_name.lower().endswith(".pdf"):
-                            b64 = base64.b64encode(file_obj.getvalue()).decode()
-                            st.markdown(f'<iframe src="data:application/pdf;base64,{b64}" width="100%" height="580" style="border:1px solid #E2E8F0;border-radius:10px;"></iframe>', unsafe_allow_html=True)
+                    preview_key = st.session_state.file_mapping.get(preview_label)
+                    preview = st.session_state.source_previews.get(preview_key)
+                    if preview:
+                        st.markdown(f"<span style='font-size:11.5px;color:#94A3B8'>📄 {preview['name']}</span>", unsafe_allow_html=True)
+                        if preview.get("kind") == "local":
+                            preview_path = Path(preview["path"])
+                            if not preview_path.exists():
+                                st.info("⚠️ 原文件已移动或删除，无法预览。")
+                                preview_bytes = None
+                            else:
+                                preview_bytes = preview_path.read_bytes()
                         else:
-                            st.image(file_obj, use_container_width=True)
+                            preview_bytes = preview["bytes"]
+                        if preview_bytes and preview["suffix"] == ".pdf":
+                            b64 = base64.b64encode(preview_bytes).decode()
+                            st.markdown(f'<iframe src="data:application/pdf;base64,{b64}" width="100%" height="580" style="border:1px solid #E2E8F0;border-radius:10px;"></iframe>', unsafe_allow_html=True)
+                        elif preview_bytes:
+                            st.image(io.BytesIO(preview_bytes), use_container_width=True)
                     else:
                         st.info("⚠️ 请重新上传对应文件以预览原件。")
                 else:
