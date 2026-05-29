@@ -194,7 +194,7 @@ def increment_usage(api_key):
 
 def classify_material(unit_price: float) -> str:
     unit_price = abs(float(unit_price or 0))
-    if unit_price < 200:
+    if unit_price < 1000:
         return "易耗品"
     if unit_price <= 1000:
         return "低值耐用品"
@@ -232,7 +232,10 @@ def build_inventory_export_df(df: pd.DataFrame) -> pd.DataFrame:
         source_columns = [column] + INVENTORY_EXPORT_ALIASES.get(column, [])
         source = next((name for name in source_columns if name in df.columns), None)
         export_data[column] = df[source] if source else ""
-    return pd.DataFrame(export_data, index=df.index)
+    export_df = pd.DataFrame(export_data, index=df.index)
+    if "开票日期" in df.columns:
+        export_df["入库时间"] = df["开票日期"].fillna("")
+    return export_df
 
 def build_excel(df: pd.DataFrame) -> bytes:
     output = io.BytesIO()
@@ -357,7 +360,7 @@ def extract_invoice_rows(source: dict, token: str, api_key: str, invoice_id: str
             "经销商": seller_name,
             "有效时间（天）": 0,
             "低库存告警数": 0,
-            "入库时间": datetime.now().strftime("%Y-%m-%d"),
+            "入库时间": invoice_date,
             "存放地点": defaults["location"],
             "验收总结": defaults["summary"],
             "验收人": defaults["inspector"],
@@ -512,6 +515,7 @@ with tab_extract:
     uploaded_files = st.file_uploader("上传发票文件（支持批量，已识别文件自动跳过）", type=["png", "jpg", "jpeg", "pdf"], accept_multiple_files=True, key=upload_key)
     if supports_directory_upload():
         directory_files = st.file_uploader("选择或拖入本地 PDF 文件夹", type=["pdf"], accept_multiple_files="directory", key=directory_key)
+        st.caption("部署到服务器后，这里仍然读取你在浏览器里选择的本地文件夹，并把其中 PDF 上传识别；不会扫描服务器本地目录。")
     else:
         directory_files = []
         st.info("当前 Streamlit 版本不支持目录上传。部署环境安装 requirements.txt 后即可使用“选择或拖入本地 PDF 文件夹”。")
